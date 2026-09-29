@@ -69,7 +69,10 @@ def main() -> None:
         # Phase 3: Wait for completion
         wait_for_completion(sub, container_id, timeout, ask)
     finally:
-        context.term()
+        # destroy, not term: term blocks until every socket is closed, and a
+        # failed build exits from inside the query with the subscription
+        # still open. The hook would hang there instead of failing.
+        context.destroy(linger=0)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ class _Zmq:
     async def publish_build_complete(self, _container_id: str) -> None:
         pass
 
+    async def publish_build_failed(self, _container_id: str, _reason: str) -> None:
+        pass
+
 
 def _plugin(build_and_mount) -> NriPlugin:
     """A plugin with only what `_spawn_build_task` touches.

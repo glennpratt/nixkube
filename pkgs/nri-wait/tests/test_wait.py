@@ -198,3 +198,58 @@ class TestSilence:
         _, path = pub
         with subscriber(path) as sub:
             wait_for_completion(sub, CONTAINER, TIMEOUT, lambda: True)
+
+
+class TestFailure:
+    """The daemon says the build failed. The hook fails now, and says why."""
+
+    def _publish_until_stopped(self, socket, payload: bytes, stop: threading.Event):
+        # Repeatedly, from the start: ZeroMQ drops what nobody has joined for
+        # yet, so a single send could land before the subscription.
+        while not stop.is_set():
+            socket.send(payload)
+            time.sleep(TIMEOUT / 20)
+
+    def test_a_failure_ends_the_wait_with_its_reason(self, pub, capsys):
+        socket, path = pub
+        reason = "build policy is 'pinned': mount sources must be store paths"
+        payload = json.dumps(
+            {"container_id": CONTAINER, "status": "failed", "reason": reason}
+        ).encode()
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._publish_until_stopped, args=(socket, payload, stop)
+        )
+        thread.start()
+        try:
+            with (
+                subscriber(path) as sub,
+                pytest.raises(SystemExit) as exit_info,
+            ):
+                started = time.time()
+                wait_for_completion(sub, CONTAINER, 10 * TIMEOUT, never)
+        finally:
+            stop.set()
+            thread.join()
+
+        assert exit_info.value.code == 1
+        assert time.time() - started < 10 * TIMEOUT, "it waited out the silence"
+        assert reason in capsys.readouterr().err.splitlines()[-1]
+
+    def test_another_containers_failure_does_not_count(self, pub):
+        socket, path = pub
+        payload = json.dumps(
+            {"container_id": "some-other-container", "status": "failed"}
+        ).encode()
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._publish_until_stopped, args=(socket, payload, stop)
+        )
+        thread.start()
+        try:
+            with subscriber(path) as sub:
+                # Only the recheck ends this wait, and it says "done".
+                wait_for_completion(sub, CONTAINER, TIMEOUT, lambda: True)
+        finally:
+            stop.set()
+            thread.join()

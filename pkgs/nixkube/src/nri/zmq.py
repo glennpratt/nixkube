@@ -157,6 +157,19 @@ class ZeroMQServer:
         except Exception:
             log.exception("zmq_publish_done_failed")
 
+    async def publish_build_failed(self, container_id: str, reason: str) -> None:
+        """Tell the wait hook the build failed, so it fails now with the reason."""
+        log = logger.bind(container_id=container_id)
+        if self.pub_socket is None:
+            return
+        try:
+            msg = json.dumps(
+                {"container_id": container_id, "status": "failed", "reason": reason}
+            )
+            await self.pub_socket.send(msg.encode())
+        except Exception:
+            log.exception("zmq_publish_failed_failed")
+
     async def start_request_handler(self) -> None:
         """Handle build status queries on REP socket (blocks until cancelled)."""
         if self.rep_socket is None:

@@ -60,6 +60,26 @@ in
         ]
       '';
     };
+    buildPolicy = lib.mkOption {
+      description = ''
+        The most work NRI may do on a node to realise a container's store.
+
+        - `build`: evaluate flake refs and expressions, and build what no
+          substituter has. For development clusters.
+        - `substitute`: evaluate, but only fetch from substituters.
+        - `pinned`: store paths only, fetched from substituters. Nothing is
+          evaluated on the node. For production clusters.
+
+        A pod may tighten this with `nixkube/pod-build` or
+        `nixkube/{container}-build`, and never loosen it.
+      '';
+      type = lib.types.enum [
+        "build"
+        "substitute"
+        "pinned"
+      ];
+      default = "build";
+    };
     nixConfig = lib.mkOption {
       description = "nix.conf for CSI/mounter/DaemonSet pods";
       type = (import ./nixOptions.nix) {
@@ -286,6 +306,7 @@ in
                         PYNIXD_ENABLED.value = lib.boolToString cfg.pynixd.enable;
                         ENABLE_COMPAT_DRIVER.value = lib.boolToString cfg.node.compat;
                         NRI_ENABLED.value = "true";
+                        NRI_BUILD_POLICY.value = cfg.node.buildPolicy;
                         HOME.value = "/nix/var/nix-csi/root";
                         HOST_MOUNT_PATH.value = cfg.hostMountPath;
                         KUBE_NAMESPACE.valueFrom.fieldRef.fieldPath = "metadata.namespace";

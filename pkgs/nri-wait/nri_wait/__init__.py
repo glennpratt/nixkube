@@ -10,6 +10,15 @@ import zmq
 __version__ = "0.1.0"
 
 
+def fail_build(container_id: str, reason: str) -> None:
+    """Exit with the daemon's reason, which runc puts in the container's status.
+
+    Last on stderr, so it ends the message a reader sees.
+    """
+    print(f"[nri-wait] {container_id}: {reason}", file=sys.stderr)
+    sys.exit(1)
+
+
 def check_build_status(
     context: zmq.Context,
     query_socket_path: str,
@@ -19,6 +28,7 @@ def check_build_status(
     """Query REP socket to check if build is already done.
 
     Returns True if build is complete, False if still pending or socket unavailable.
+    Raises SystemExit(1) if the daemon says the build failed.
     """
     req = context.socket(zmq.REQ)
 
@@ -66,6 +76,10 @@ def check_build_status(
             return True
     except (json.JSONDecodeError, UnicodeDecodeError, KeyError) as e:
         print(f"[nri-wait] Failed to parse response: {e}", file=sys.stderr)
+        return False
+
+    if response.get("status") == "failed":
+        fail_build(oci_state.get("id", "?"), response.get("reason", "build failed"))
 
     return False
 
@@ -176,6 +190,10 @@ def wait_for_completion(
             )
             sub.close()
             return
+
+        if msg.get("status") == "failed":
+            sub.close()
+            fail_build(container_id, msg.get("reason", "build failed"))
 
         if msg.get("status") in ("progress", "building"):
             deadline = time.time() + timeout

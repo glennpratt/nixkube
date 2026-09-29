@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 import shutil
 import time
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any
 
@@ -33,17 +33,32 @@ from ..metrics import (
     NRI_CONTAINERS_SEEN,
     NRI_STATE_CHANGES,
 )
-from ..nix import fetch_packages, get_build_args, get_current_system
+from ..nix import (
+    build_flake_ref,
+    build_nix_expr,
+    fetch_packages,
+    get_build_args,
+    get_current_system,
+)
 from ..supervision import detach
 from ..volume import prepare_volume
 from .annotations import (
+    MountSource,
     extract_container_store_paths,
+    parse_build_policy,
     parse_nix_exclude,
     parse_nix_rw,
     parse_store_mounts,
 )
 from .cleanup import schedule_garbage_collection
 from .mount import kernel_supports_ro, kernel_supports_rw, mount_in_container
+from .policy import (
+    BuildPolicy,
+    BuildPolicyError,
+    effective_build_policy,
+    nix_policy_args,
+    node_build_policy,
+)
 from .zmq import ZeroMQServer
 
 # ============================================================================
@@ -181,6 +196,23 @@ from .zmq import ZeroMQServer
 # ============================================================================
 
 
+def _failure_reason(error: BaseException) -> str:
+    """One line for the container's status: the error, and the last of its logs.
+
+    A BuildError's own message is only "Failed to build ..."; the line that
+    says why ("... no substituter can build it") is the last one Nix printed.
+    """
+    # The build runs in a task group with its progress pump, so what arrives
+    # here is a group around the error that says anything.
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    logs = getattr(error, "logs", "") or ""
+    last = next((line for line in reversed(logs.splitlines()) if line.strip()), "")
+    # CSIError is a GRPCError, whose str() is its status tuple.
+    message = getattr(error, "message", None) or str(error)
+    return f"{message}: {last.strip()}" if last else message
+
+
 def nri_error_handler(
     func: Any,
 ) -> Any:  # decorator wraps arbitrary async handler methods
@@ -298,10 +330,37 @@ class NriPlugin(NriPluginBase):
                     "RW overlay mounts not supported on this kernel (requires Linux 6.5+)"
                 )
 
+        # Flake refs and expressions among the mount sources are realised by
+        # the build task, so they need one even with no store path to fetch.
+        flake_mounts = {
+            dst: src for dst, src in store_mounts.items() if isinstance(src, str)
+        }
+
+        # A refusal must not raise. containerd answers a plugin that fails a
+        # request by closing it, and every container created before it
+        # reconnects starts with no injection at all. So a refused container
+        # gets the wait hook with its status already "failed", and fails in
+        # the hook, with the reason, like a build that failed.
+        refusal: str | None = None
+        try:
+            build_policy = effective_build_policy(
+                node_build_policy(),
+                parse_build_policy(req.pod.annotations, req.container.name, system),
+            )
+        except BuildPolicyError as e:
+            build_policy, refusal = BuildPolicy.PINNED, str(e)
+        if flake_mounts and build_policy is BuildPolicy.PINNED and refusal is None:
+            refusal = (
+                "build policy is 'pinned': mount sources must be store paths, not "
+                "flake refs or expressions: "
+                + ", ".join(f"{dst}={src}" for dst, src in flake_mounts.items())
+            )
+        logger.debug("build_policy", policy=build_policy.name.lower(), refusal=refusal)
+
         adjust = nri_pb2.ContainerAdjustment()
 
         # Enable NRI build if we have storepaths to inject
-        if store_paths:
+        if store_paths or flake_mounts:
             container_id = req.container.id
 
             logger.info("store_injection_enabled", count=len(store_paths))
@@ -348,8 +407,28 @@ class NriPlugin(NriPluginBase):
                     coreutils_host=coreutils_host,
                 )
 
+                if refusal is not None:
+                    logger.warning("build_policy_refused", reason=refusal)
+                    self.zmq_server.build_status[container_id] = {
+                        "status": "failed",
+                        "reason": refusal,
+                    }
+                    # Detached: this handler has about two seconds before
+                    # containerd gives up on the plugin, and an API call can
+                    # take longer than that on its own.
+                    detach(
+                        self.tasks,
+                        partial(
+                            report_event,
+                            pod,
+                            reason="BuildPolicyRefused",
+                            note=refusal,
+                            event_type="Warning",
+                        ),
+                        name="nri_refusal_event",
+                    )
                 # Spawn build task to build store paths and namespace-mount them into the container
-                if container_id not in self.zmq_server.pending_builds:
+                elif container_id not in self.zmq_server.pending_builds:
                     self.zmq_server.pending_builds.add(container_id)
                     logger.info("build_task_spawning", count=len(store_paths))
                     try:
@@ -362,6 +441,7 @@ class NriPlugin(NriPluginBase):
                             store_paths,
                             store_mounts,
                             nix_rw,
+                            build_policy,
                             name="nri_build",
                         )
                     except Exception:
@@ -375,7 +455,9 @@ class NriPlugin(NriPluginBase):
                 else:
                     logger.warning("build_already_pending")
 
-                NRI_CONTAINERS_SEEN.labels(result="injected").inc()
+                NRI_CONTAINERS_SEEN.labels(
+                    result="refused" if refusal is not None else "injected"
+                ).inc()
 
             except Exception:
                 NRI_CONTAINERS_SEEN.labels(result="error").inc()
@@ -441,8 +523,9 @@ class NriPlugin(NriPluginBase):
         container_name: str,
         pod: Pod,
         store_paths: set[Path],
-        store_mounts: dict[Path, Path] | None = None,
+        store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
+        build_policy: BuildPolicy = BuildPolicy.BUILD,
     ) -> None:
         """Run the build inside a scope the volume sweep can cancel.
 
@@ -455,7 +538,13 @@ class NriPlugin(NriPluginBase):
         self.zmq_server.pending_builds.attach(container_id, scope)
         with scope:
             await self._run_build_task(
-                container_id, container_name, pod, store_paths, store_mounts, nix_rw
+                container_id,
+                container_name,
+                pod,
+                store_paths,
+                store_mounts,
+                nix_rw,
+                build_policy,
             )
 
     async def _run_build_task(
@@ -464,8 +553,9 @@ class NriPlugin(NriPluginBase):
         container_name: str,
         pod: Pod,
         store_paths: set[Path],
-        store_mounts: dict[Path, Path] | None = None,
+        store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
+        build_policy: BuildPolicy = BuildPolicy.BUILD,
     ) -> None:
         """Realize store paths, link into the volume, then namespace-mount store mounts.
 
@@ -483,7 +573,7 @@ class NriPlugin(NriPluginBase):
         NRI_BUILDS_IN_FLIGHT.inc()
         try:
             # If no store paths to build, just mark as done
-            if not store_paths:
+            if not store_paths and not store_mounts:
                 log.info("no_store_paths")
                 self.zmq_server.build_status[container_id] = {"status": "done"}
                 await self.zmq_server.publish_build_complete(container_id)
@@ -498,8 +588,13 @@ class NriPlugin(NriPluginBase):
                 pump.start_soon(self._pump_build_progress, container_id)
                 log.debug("progress_pump_started")
                 try:
-                    await self._build_and_mount(
-                        log, container_id, store_paths, store_mounts, nix_rw
+                    store_paths = await self._build_and_mount(
+                        log,
+                        container_id,
+                        store_paths,
+                        store_mounts,
+                        nix_rw,
+                        build_policy,
                     )
                 finally:
                     pump.cancel_scope.cancel()
@@ -527,12 +622,30 @@ class NriPlugin(NriPluginBase):
             log.exception("build_task_failed")
             self.zmq_server.pending_builds.discard(container_id)
 
+            # Fail the wait hook now, with the reason, instead of leaving it
+            # to time out on the silence. Under a policy that forbids builds,
+            # Nix's own words ("set 'max-jobs' to a non-zero value") point at
+            # the wrong fix, so the policy speaks first.
+            reason = _failure_reason(e)
+            if build_policy is not BuildPolicy.BUILD:
+                reason = (
+                    f"build policy is '{build_policy.name.lower()}', so nothing is "
+                    f"built on this node: {reason}"
+                )
+            self.zmq_server.build_status[container_id] = {
+                "status": "failed",
+                "reason": reason,
+            }
+            await self.zmq_server.publish_build_failed(
+                container_id, self.zmq_server.build_status[container_id]["reason"]
+            )
+
             # Report failed build
             await report_event(
                 pod,
                 reason="BuildFailed",
                 note=f"Failed to build store paths for container {container_name}",
-                logs=str(e),
+                logs=reason,
                 event_type="Warning",
             )
         finally:
@@ -552,19 +665,42 @@ class NriPlugin(NriPluginBase):
         log: Any,
         container_id: str,
         store_paths: set[Path],
-        store_mounts: dict[Path, Path] | None,
+        store_mounts: dict[Path, MountSource] | None,
         nix_rw: bool,
-    ) -> None:
+        build_policy: BuildPolicy = BuildPolicy.BUILD,
+    ) -> set[Path]:
         """Realize the closure, link it in, then mount it into the namespace.
 
         Split from `_spawn_build_task` so the progress pump's task group wraps
-        exactly this and nothing else.
+        exactly this and nothing else. Returns the store paths it realised,
+        which includes what the flake refs among `store_mounts` resolved to.
         """
-        # Get extra build args for builders and cache
-        extra_args = await get_build_args()
+        # Get extra build args for builders and cache, then the policy's,
+        # which come last so they override the builders.
+        extra_args = [*await get_build_args(), *nix_policy_args(build_policy)]
+
+        volume_path = NRI_CONTAINERS / container_id
+
+        # Resolve flake refs and expressions to store paths first; from here
+        # on they are store paths like any other. One gc root each, inside
+        # the volume, so they live exactly as long as the container.
+        store_mounts = dict(store_mounts or {})
+        store_paths = set(store_paths)
+        for i, (dst, src) in enumerate(sorted(store_mounts.items())):
+            if isinstance(src, Path):
+                continue
+            gc_root = volume_path / f"source-{i}"
+            gc_root.mkdir(parents=True, exist_ok=True)
+            log.info("mount_source_building", source=src, destination=str(dst))
+            # A flake ref is a URL and never contains whitespace; any
+            # expression worth writing does.
+            build = build_nix_expr if any(c.isspace() for c in src) else build_flake_ref
+            resolved = await build(src, gc_root, extra_args)
+            log.info("mount_source_built", source=src, store_path=str(resolved))
+            store_mounts[dst] = resolved
+            store_paths.add(resolved)
 
         # Realize storepaths
-        volume_path = NRI_CONTAINERS / container_id
         log.debug("fetch_packages_starting", count=len(store_paths))
         await fetch_packages(store_paths, volume_path, extra_args)
         log.debug("fetch_packages_done")
@@ -611,6 +747,7 @@ class NriPlugin(NriPluginBase):
             farm=len(farm_paths) if farm_paths else 0,
         )
         await mount_in_container(pid, bundle, nix_tree_path, mounts, nix_rw, farm_paths)
+        return store_paths
 
 
 async def nri_serve() -> None:

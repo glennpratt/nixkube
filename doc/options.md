@@ -765,6 +765,39 @@ true
 
 
 
+## nixkube\.node\.buildPolicy
+
+
+
+The most work NRI may do on a node to realise a container’s store\.
+
+ - ` build `: evaluate flake refs and expressions, and build what no
+   substituter has\. For development clusters\.
+ - ` substitute `: evaluate, but only fetch from substituters\.
+ - ` pinned `: store paths only, fetched from substituters\. Nothing is
+   evaluated on the node\. For production clusters\.
+
+A pod may tighten this with ` nixkube/pod-build ` or
+` nixkube/{container}-build `, and never loosen it\.
+
+
+
+*Type:*
+one of “build”, “substitute”, “pinned”
+
+
+
+*Default:*
+
+```nix
+"build"
+```
+
+*Declared by:*
+ - [/kubenix/daemonset\.nix](file:///kubenix/daemonset.nix)
+
+
+
 ## nixkube\.node\.compat
 
 
