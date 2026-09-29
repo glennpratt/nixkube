@@ -24,15 +24,23 @@ MountSource = Path | str
 def _iter_annotations(
     annotations: Annotations, target: str, system: str
 ) -> Iterator[str]:
-    """Yield annotation values for nixkube/{target}(@{system})?(-{index})? annotations.
+    """Yield annotation values for nixkube/{target}(.{system})?(-{index})? annotations.
 
-    Annotations without @system apply to all systems. System-qualified annotations
-    (@system) are only yielded when system matches.
+    Annotations without a system apply to all systems. System-qualified
+    annotations are only yielded when the system matches.
+
+    The system is joined with `.`: `nixkube/pod.x86_64-linux`. `@` is accepted
+    too, as it was documented first, but the API server refuses it in an
+    annotation key, so a pod written with it cannot be created. `.` is
+    unambiguous because neither a container name (a DNS label) nor `pod` can
+    contain one.
 
     The optional -index suffix (always last) allows multiple annotations for the same
     target (e.g., nixkube/pod-1, nixkube/pod-2) and is ignored by the parser.
     """
-    pattern = re.compile(rf"^nixkube/{re.escape(target)}(@{re.escape(system)}|)(-.*|)$")
+    pattern = re.compile(
+        rf"^nixkube/{re.escape(target)}([@.]{re.escape(system)}|)(-.*|)$"
+    )
     return (value for key, value in annotations.items() if pattern.fullmatch(key))
 
 
@@ -42,7 +50,7 @@ def extract_container_store_paths(
     """Extract Nix store paths from an NRI CreateContainerRequest.
 
     Scans container env, args, and pod annotations with nixkube/pod or
-    nixkube/{container-name} prefixes. System-specific annotations (@{system})
+    nixkube/{container-name} prefixes. System-specific annotations (.{system})
     are only included when they match the current system; unqualified annotations
     apply to all systems.
     """
@@ -61,7 +69,7 @@ def _parse_store_mounts_for_name(
     """
     Parse store mount annotations matching a specific name (container name or "pod" for wildcard).
 
-    Annotations format: nixkube/{target-name}(@{system})?(-{index})?: /path/in/container=/source
+    Annotations format: nixkube/{target-name}(.{system})?(-{index})?: /path/in/container=/source
     - system: optional, filters annotation to specific system (e.g., x86_64-linux, aarch64-linux)
     - index: optional, allows multiple mounts per target (ignored by parser)
     - source: a store path (absolute), otherwise a flake reference or a Nix
@@ -69,16 +77,16 @@ def _parse_store_mounts_for_name(
 
     For wildcard (target_name="pod"):
       nixkube/pod-1: /etc/ssl/certs=/nix/store/cacert-1.0/etc/ssl/certs
-      nixkube/pod@x86_64-linux-2: /etc/passwd=/nix/store/fakeNss-x86/etc/passwd
+      nixkube/pod.x86_64-linux-2: /etc/passwd=/nix/store/fakeNss-x86/etc/passwd
 
     For container (target_name="myapp"):
-      nixkube/myapp@aarch64-linux-1: /etc/ssl=/nix/store/cacert-aarch64/etc/ssl
+      nixkube/myapp.aarch64-linux-1: /etc/ssl=/nix/store/cacert-aarch64/etc/ssl
 
     Flake reference, realised on the node:
       nixkube/myapp: /app=github:NixOS/nixpkgs/<rev>#redis
 
     Returns: {Path("/path/in/container"): Path("/nix/store/.../package") or "flake#ref"}
-    Annotations without @system apply to all systems.
+    Annotations without a system qualifier apply to all systems.
     """
     return {
         Path(container_path): Path(source) if source.startswith("/") else source
@@ -96,13 +104,13 @@ def parse_nix_rw(
     Container-specific annotation takes precedence over the pod-wide default,
     including an explicit "false" to opt a single container out of pod-wide RW.
 
-    Supports system-specific variants with @{system} suffix.
+    Supports system-specific variants with .{system} suffix.
 
     Annotations:
       nixkube/pod-rw: "true"                 — all containers get RW /nix
-      nixkube/pod-rw@x86_64-linux: "true"   — all containers get RW /nix on x86_64
+      nixkube/pod-rw.x86_64-linux: "true"   — all containers get RW /nix on x86_64
       nixkube/{container-name}-rw: "true"   — only this container gets RW /nix
-      nixkube/{container-name}-rw@aarch64-linux: "false" — this container stays RO on aarch64
+      nixkube/{container-name}-rw.aarch64-linux: "false" — this container stays RO on aarch64
     """
     container_values = list(
         _iter_annotations(pod_annotations, f"{container_name}-rw", system)
@@ -138,7 +146,7 @@ def parse_nix_exclude(
     Annotations:
       nixkube/pod-exclude: "true"                  — no container is injected into
       nixkube/{container-name}-exclude: "true"     — only this one is left alone
-      nixkube/{container-name}-exclude@x86_64-linux: "false" — back in, on x86_64
+      nixkube/{container-name}-exclude.x86_64-linux: "false" — back in, on x86_64
     """
     container_values = list(
         _iter_annotations(pod_annotations, f"{container_name}-exclude", system)
@@ -182,19 +190,19 @@ def parse_store_mounts(
     Supports annotation patterns:
     1. Pod-wide (apply to all containers):  nixkube/pod: /etc/ssl=/source
     2. Container-specific (overrides pod-wide): nixkube/container-name: /etc/ssl=/source
-    3. System-specific variants with @{system} suffix
+    3. System-specific variants with .{system} suffix
 
     Source is auto-detected: store path, flake reference, or nix expression.
 
     Example annotations:
       nixkube/pod: /etc/ssl/certs=/nix/store/abc-cacert-1.0/etc/ssl/certs
-      nixkube/pod@x86_64-linux: /etc/passwd=/nix/store/fakeNss-x86/etc/passwd
-      nixkube/myapp@aarch64-linux-1: /etc/ssl=/nix/store/cacert-aarch64
+      nixkube/pod.x86_64-linux: /etc/passwd=/nix/store/fakeNss-x86/etc/passwd
+      nixkube/myapp.aarch64-linux-1: /etc/ssl=/nix/store/cacert-aarch64
 
     Returns dict: {Path("/path/in/container"): Path("/source")}
     - Container-specific annotations override pod-wide annotations for the same path
     - System-specific annotations apply only to matching system
-    - Annotations without @system apply to all systems
+    - Annotations without a system qualifier apply to all systems
     """
     # Container-specific overrides pod-wide for the same path
     return {
