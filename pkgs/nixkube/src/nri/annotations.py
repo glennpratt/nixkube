@@ -13,6 +13,12 @@ from ..store import extract_store_paths
 # Using Mapping keeps us compatible with both protobuf types and plain dicts (tests).
 Annotations = Mapping[str, str]
 
+# Where a store mount comes from. An absolute path is a store path, used as
+# is. Anything else is a flake reference or a Nix expression for the build
+# task to realise, and stays a string: `Path` would fold the `//` in
+# `git+https://...` to `/`.
+MountSource = Path | str
+
 
 def _iter_annotations(
     annotations: Annotations, target: str, system: str
@@ -50,14 +56,15 @@ def extract_container_store_paths(
 
 def _parse_store_mounts_for_name(
     pod_annotations: Annotations, target_name: str, system: str
-) -> dict[Path, Path]:
+) -> dict[Path, MountSource]:
     """
     Parse store mount annotations matching a specific name (container name or "pod" for wildcard).
 
     Annotations format: nixkube/{target-name}(@{system})?(-{index})?: /path/in/container=/source
     - system: optional, filters annotation to specific system (e.g., x86_64-linux, aarch64-linux)
     - index: optional, allows multiple mounts per target (ignored by parser)
-    - source: auto-detected as store path, flake reference, or nix expression
+    - source: a store path (absolute), otherwise a flake reference or a Nix
+      expression, kept verbatim and realised by the build task
 
     For wildcard (target_name="pod"):
       nixkube/pod-1: /etc/ssl/certs=/nix/store/cacert-1.0/etc/ssl/certs
@@ -66,11 +73,14 @@ def _parse_store_mounts_for_name(
     For container (target_name="myapp"):
       nixkube/myapp@aarch64-linux-1: /etc/ssl=/nix/store/cacert-aarch64/etc/ssl
 
-    Returns: {Path("/path/in/container"): Path("/nix/store/.../package")}
+    Flake reference, realised on the node:
+      nixkube/myapp: /app=github:NixOS/nixpkgs/<rev>#redis
+
+    Returns: {Path("/path/in/container"): Path("/nix/store/.../package") or "flake#ref"}
     Annotations without @system apply to all systems.
     """
     return {
-        Path(container_path): Path(source)
+        Path(container_path): Path(source) if source.startswith("/") else source
         for value in _iter_annotations(pod_annotations, target_name, system)
         if "=" in value
         for container_path, source in [value.split("=", 1)]
@@ -141,7 +151,7 @@ def parse_nix_exclude(
 
 def parse_store_mounts(
     pod_annotations: Annotations, container_name: str, system: str
-) -> dict[Path, Path]:
+) -> dict[Path, MountSource]:
     """
     Parse store mount annotations from pod metadata with system filtering.
 

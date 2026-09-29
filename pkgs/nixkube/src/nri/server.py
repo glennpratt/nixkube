@@ -35,10 +35,17 @@ from ..metrics import (
     NRI_CONTAINERS_SEEN,
     NRI_STATE_CHANGES,
 )
-from ..nix import fetch_packages, get_build_args, get_current_system
+from ..nix import (
+    build_flake_ref,
+    build_nix_expr,
+    fetch_packages,
+    get_build_args,
+    get_current_system,
+)
 from ..supervision import detach
 from ..volume import prepare_volume
 from .annotations import (
+    MountSource,
     extract_container_store_paths,
     parse_nix_exclude,
     parse_nix_rw,
@@ -303,7 +310,13 @@ class NriPlugin(NriPluginBase):
         adjust = nri_pb2.ContainerAdjustment()
 
         # Enable NRI build if we have storepaths to inject
-        if store_paths:
+        # Flake refs and expressions among the mount sources are realised by
+        # the build task, so they need one even with no store path to fetch.
+        flake_mounts = {
+            dst: src for dst, src in store_mounts.items() if isinstance(src, str)
+        }
+
+        if store_paths or flake_mounts:
             container_id = req.container.id
 
             logger.info("store_injection_enabled", count=len(store_paths))
@@ -443,7 +456,7 @@ class NriPlugin(NriPluginBase):
         container_name: str,
         pod: Pod,
         store_paths: set[Path],
-        store_mounts: dict[Path, Path] | None = None,
+        store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
     ) -> None:
         """Run the build inside a scope the volume sweep can cancel.
@@ -466,7 +479,7 @@ class NriPlugin(NriPluginBase):
         container_name: str,
         pod: Pod,
         store_paths: set[Path],
-        store_mounts: dict[Path, Path] | None = None,
+        store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
     ) -> None:
         """Realize store paths, link into the volume, then namespace-mount store mounts.
@@ -485,7 +498,7 @@ class NriPlugin(NriPluginBase):
         NRI_BUILDS_IN_FLIGHT.inc()
         try:
             # If no store paths to build, just mark as done
-            if not store_paths:
+            if not store_paths and not store_mounts:
                 log.info("no_store_paths")
                 self.zmq_server.build_status[container_id] = {"status": "done"}
                 await self.zmq_server.publish_build_complete(container_id)
@@ -500,7 +513,7 @@ class NriPlugin(NriPluginBase):
                 pump.start_soon(self._pump_build_progress, container_id)
                 log.debug("progress_pump_started")
                 try:
-                    await self._build_and_mount(
+                    store_paths = await self._build_and_mount(
                         log, container_id, store_paths, store_mounts, nix_rw
                     )
                 finally:
@@ -562,19 +575,40 @@ class NriPlugin(NriPluginBase):
         log: Any,
         container_id: str,
         store_paths: set[Path],
-        store_mounts: dict[Path, Path] | None,
+        store_mounts: dict[Path, MountSource] | None,
         nix_rw: bool,
-    ) -> None:
+    ) -> set[Path]:
         """Realize the closure, link it in, then mount it into the namespace.
 
         Split from `_spawn_build_task` so the progress pump's task group wraps
-        exactly this and nothing else.
+        exactly this and nothing else. Returns the store paths it realised,
+        which includes what the flake refs among `store_mounts` resolved to.
         """
         # Get extra build args for builders and cache
         extra_args = await get_build_args()
 
-        # Realize storepaths
         volume_path = NRI_CONTAINERS / container_id
+
+        # Resolve flake refs and expressions to store paths first; from here
+        # on they are store paths like any other. One gc root each, inside
+        # the volume, so they live exactly as long as the container.
+        store_mounts = dict(store_mounts or {})
+        store_paths = set(store_paths)
+        for i, (dst, src) in enumerate(sorted(store_mounts.items())):
+            if isinstance(src, Path):
+                continue
+            gc_root = volume_path / f"source-{i}"
+            gc_root.mkdir(parents=True, exist_ok=True)
+            log.info("mount_source_building", source=src, destination=str(dst))
+            # A flake ref is a URL and never contains whitespace; any
+            # expression worth writing does.
+            build = build_nix_expr if any(c.isspace() for c in src) else build_flake_ref
+            resolved = await build(src, gc_root, extra_args)
+            log.info("mount_source_built", source=src, store_path=str(resolved))
+            store_mounts[dst] = resolved
+            store_paths.add(resolved)
+
+        # Realize storepaths
         log.debug("fetch_packages_starting", count=len(store_paths))
         await fetch_packages(store_paths, volume_path, extra_args)
         log.debug("fetch_packages_done")
@@ -630,6 +664,7 @@ class NriPlugin(NriPluginBase):
             farm=len(farm_paths) if farm_paths else 0,
         )
         await mount_in_container(pid, rootfs, nix_tree_path, mounts, nix_rw, farm_paths)
+        return store_paths
 
 
 async def reachable_rootfs(pid: int, bundle: str) -> str | None:

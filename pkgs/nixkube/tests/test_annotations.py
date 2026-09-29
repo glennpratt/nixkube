@@ -140,22 +140,22 @@ class TestParseStoreMountsForName:
         assert result[Path("/etc/ssl")] == Path("/nix/store/cacert")
 
     def test_flake_reference_detection(self):
-        """Flake references are preserved as source paths."""
+        """Flake references are kept verbatim, as strings, for the build task.
+
+        Not `Path`: it folds the `//` in `git+https://...` refs."""
         annotations = {
             "nixkube/pod": "/etc/myapp=github:nixos/nixpkgs#legacyPackages.x86_64-linux.hello"
         }
         result = _parse_store_mounts_for_name(annotations, "pod", "x86_64-linux")
         assert result == {
-            Path("/etc/myapp"): Path(
-                "github:nixos/nixpkgs#legacyPackages.x86_64-linux.hello"
-            )
+            Path("/etc/myapp"): "github:nixos/nixpkgs#legacyPackages.x86_64-linux.hello"
         }
 
     def test_nix_expression_detection(self):
-        """Nix expressions are preserved as source paths."""
+        """Nix expressions are kept verbatim, as strings, for the build task."""
         annotations = {"nixkube/pod": '/etc/result=builtins.toFile "test" "value"'}
         result = _parse_store_mounts_for_name(annotations, "pod", "x86_64-linux")
-        assert result == {Path("/etc/result"): Path('builtins.toFile "test" "value"')}
+        assert result == {Path("/etc/result"): 'builtins.toFile "test" "value"'}
 
 
 class TestParseStoreMounts:
