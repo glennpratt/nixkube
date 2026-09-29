@@ -158,6 +158,23 @@ class TestParseStoreMountsForName:
         assert result == {Path("/etc/result"): Path('builtins.toFile "test" "value"')}
 
 
+class TestSystemSeparator:
+    """`@` is what the docs said, and what the API server refuses in a key."""
+
+    def test_a_dot_qualifies_the_system(self):
+        annotations = {"nixkube/app.x86_64-linux-2": "/opt=/nix/store/abc-x86"}
+        assert _parse_store_mounts_for_name(annotations, "app", "x86_64-linux") == {
+            Path("/opt"): Path("/nix/store/abc-x86")
+        }
+        assert _parse_store_mounts_for_name(annotations, "app", "aarch64-linux") == {}
+
+    def test_the_at_form_still_parses(self):
+        annotations = {"nixkube/app@x86_64-linux": "/opt=/nix/store/abc-x86"}
+        assert _parse_store_mounts_for_name(annotations, "app", "x86_64-linux") == {
+            Path("/opt"): Path("/nix/store/abc-x86")
+        }
+
+
 class TestParseStoreMounts:
     """Test parse_store_mounts with wildcard and container-specific merging."""
 
