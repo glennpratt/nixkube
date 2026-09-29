@@ -17,6 +17,9 @@ pkgs.buildEnv {
     coreutils
     fishMinimal
     nix
+    # Nix runs git to fetch git+https/git+ssh/git+git flake refs, for CSI
+    # flakeRef volumes and NRI flake-ref mounts alike.
+    gitMinimal
     openssh
     util-linuxMinimal
     gnugrep
