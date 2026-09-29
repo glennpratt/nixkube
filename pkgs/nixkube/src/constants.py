@@ -121,6 +121,11 @@ MOUNT_BUDGET_FALLBACK_RATIO: float = _parse_float_env(
 # storage disagrees can go back to hardlinks without a new image.
 NRI_BIND_FARM = os.environ.get("NRI_BIND_FARM", "true") == "true"
 
+# The most work NRI may do on this node to realise a container's store:
+# "build", "substitute" or "pinned". See `nri/policy.py`. The default keeps
+# what NRI has always done.
+NRI_BUILD_POLICY = os.environ.get("NRI_BUILD_POLICY", "build")
+
 # How long `nix store verify --recursive --no-trust` may take.
 #
 # It is the longest nix call on the publish path when it runs at all, and the

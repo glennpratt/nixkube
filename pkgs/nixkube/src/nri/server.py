@@ -2,7 +2,7 @@
 import json
 import shutil
 import time
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any
 
@@ -47,12 +47,20 @@ from ..volume import prepare_volume
 from .annotations import (
     MountSource,
     extract_container_store_paths,
+    parse_build_policy,
     parse_nix_exclude,
     parse_nix_rw,
     parse_store_mounts,
 )
 from .cleanup import schedule_garbage_collection
 from .mount import kernel_supports_ro, kernel_supports_rw, mount_in_container, rootfs_of
+from .policy import (
+    BuildPolicy,
+    BuildPolicyError,
+    effective_build_policy,
+    nix_policy_args,
+    node_build_policy,
+)
 from .zmq import ZeroMQServer
 
 # ============================================================================
@@ -316,6 +324,27 @@ class NriPlugin(NriPluginBase):
             dst: src for dst, src in store_mounts.items() if isinstance(src, str)
         }
 
+        # A refusal must not raise. containerd answers a plugin that fails a
+        # request by closing it, and every container created before it
+        # reconnects starts with no injection at all. So a refused container
+        # gets the wait hook with its status already "failed", and fails in
+        # the hook with the reason, as a failed build does.
+        refusal: str | None = None
+        try:
+            build_policy = effective_build_policy(
+                node_build_policy(),
+                parse_build_policy(req.pod.annotations, req.container.name, system),
+            )
+        except BuildPolicyError as e:
+            build_policy, refusal = BuildPolicy.PINNED, str(e)
+        if flake_mounts and build_policy is BuildPolicy.PINNED and refusal is None:
+            refusal = (
+                "build policy is 'pinned': mount sources must be store paths, not "
+                "flake refs or expressions: "
+                + ", ".join(f"{dst}={src}" for dst, src in flake_mounts.items())
+            )
+        logger.debug("build_policy", policy=build_policy.name.lower(), refusal=refusal)
+
         if store_paths or flake_mounts:
             container_id = req.container.id
 
@@ -363,8 +392,28 @@ class NriPlugin(NriPluginBase):
                     coreutils_host=coreutils_host,
                 )
 
+                if refusal is not None:
+                    logger.warning("build_policy_refused", reason=refusal)
+                    self.zmq_server.build_status[container_id] = {
+                        "status": "failed",
+                        "reason": refusal,
+                    }
+                    # Detached: this handler has about two seconds before
+                    # containerd gives up on the plugin, and an API call can
+                    # take longer than that on its own.
+                    detach(
+                        self.tasks,
+                        partial(
+                            report_event,
+                            pod,
+                            reason="BuildPolicyRefused",
+                            note=refusal,
+                            event_type="Warning",
+                        ),
+                        name="nri_refusal_event",
+                    )
                 # Spawn build task to build store paths and namespace-mount them into the container
-                if container_id not in self.zmq_server.pending_builds:
+                elif container_id not in self.zmq_server.pending_builds:
                     self.zmq_server.pending_builds.add(container_id)
                     logger.info("build_task_spawning", count=len(store_paths))
                     try:
@@ -377,6 +426,7 @@ class NriPlugin(NriPluginBase):
                             store_paths,
                             store_mounts,
                             nix_rw,
+                            build_policy,
                             name="nri_build",
                         )
                     except Exception:
@@ -390,7 +440,9 @@ class NriPlugin(NriPluginBase):
                 else:
                     logger.warning("build_already_pending")
 
-                NRI_CONTAINERS_SEEN.labels(result="injected").inc()
+                NRI_CONTAINERS_SEEN.labels(
+                    result="refused" if refusal is not None else "injected"
+                ).inc()
 
             except Exception:
                 NRI_CONTAINERS_SEEN.labels(result="error").inc()
@@ -458,6 +510,7 @@ class NriPlugin(NriPluginBase):
         store_paths: set[Path],
         store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
+        build_policy: BuildPolicy = BuildPolicy.BUILD,
     ) -> None:
         """Run the build inside a scope the volume sweep can cancel.
 
@@ -470,7 +523,13 @@ class NriPlugin(NriPluginBase):
         self.zmq_server.pending_builds.attach(container_id, scope)
         with scope:
             await self._run_build_task(
-                container_id, container_name, pod, store_paths, store_mounts, nix_rw
+                container_id,
+                container_name,
+                pod,
+                store_paths,
+                store_mounts,
+                nix_rw,
+                build_policy,
             )
 
     async def _run_build_task(
@@ -481,6 +540,7 @@ class NriPlugin(NriPluginBase):
         store_paths: set[Path],
         store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
+        build_policy: BuildPolicy = BuildPolicy.BUILD,
     ) -> None:
         """Realize store paths, link into the volume, then namespace-mount store mounts.
 
@@ -514,7 +574,12 @@ class NriPlugin(NriPluginBase):
                 log.debug("progress_pump_started")
                 try:
                     store_paths = await self._build_and_mount(
-                        log, container_id, store_paths, store_mounts, nix_rw
+                        log,
+                        container_id,
+                        store_paths,
+                        store_mounts,
+                        nix_rw,
+                        build_policy,
                     )
                 finally:
                     pump.cancel_scope.cancel()
@@ -542,6 +607,13 @@ class NriPlugin(NriPluginBase):
             log.exception("build_task_failed")
             self.zmq_server.pending_builds.discard(container_id)
             reason = failure_reason(e)
+            # Under a policy that forbids builds, Nix's own words ("set
+            # 'max-jobs' to a non-zero value") point at the wrong fix.
+            if build_policy is not BuildPolicy.BUILD:
+                reason = (
+                    f"build policy is '{build_policy.name.lower()}', so nothing is "
+                    f"built on this node: {reason}"
+                )
             # So the hook fails now, with the reason, instead of after its
             # timeout with none.
             self.zmq_server.build_status[container_id] = {
@@ -577,6 +649,7 @@ class NriPlugin(NriPluginBase):
         store_paths: set[Path],
         store_mounts: dict[Path, MountSource] | None,
         nix_rw: bool,
+        build_policy: BuildPolicy = BuildPolicy.BUILD,
     ) -> set[Path]:
         """Realize the closure, link it in, then mount it into the namespace.
 
@@ -584,8 +657,9 @@ class NriPlugin(NriPluginBase):
         exactly this and nothing else. Returns the store paths it realised,
         which includes what the flake refs among `store_mounts` resolved to.
         """
-        # Get extra build args for builders and cache
-        extra_args = await get_build_args()
+        # Get extra build args for builders and cache, then the policy's,
+        # which come last so they override the builders.
+        extra_args = [*await get_build_args(), *nix_policy_args(build_policy)]
 
         volume_path = NRI_CONTAINERS / container_id
 

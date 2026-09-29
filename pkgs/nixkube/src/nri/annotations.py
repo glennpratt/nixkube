@@ -8,6 +8,7 @@ from pathlib import Path
 from nri import nri_pb2
 
 from ..store import extract_store_paths
+from .policy import BuildPolicy
 
 # Annotations from protobuf are ScalarMap[str, str], which implements Mapping.
 # Using Mapping keeps us compatible with both protobuf types and plain dicts (tests).
@@ -147,6 +148,29 @@ def parse_nix_exclude(
     return any(
         v == "true" for v in _iter_annotations(pod_annotations, "pod-exclude", system)
     )
+
+
+def parse_build_policy(
+    pod_annotations: Annotations, container_name: str, system: str
+) -> BuildPolicy | None:
+    """The build policy this container asks for, or None if it does not ask.
+
+    Same shape as `parse_nix_rw`: a container-specific annotation wins over
+    the pod-wide one. A request can only tighten the node's policy (see
+    `effective_build_policy`), so if several annotations match, the strictest
+    counts. An unknown value raises rather than being ignored: a pod that
+    meant "pinned" and misspelt it must not get the node's default.
+
+    Annotations:
+      nixkube/pod-build: "substitute"                 — no container builds
+      nixkube/{container-name}-build: "pinned"       — store paths only here
+    """
+    values = list(
+        _iter_annotations(pod_annotations, f"{container_name}-build", system)
+    ) or list(_iter_annotations(pod_annotations, "pod-build", system))
+    if not values:
+        return None
+    return min(BuildPolicy.parse(v) for v in values)
 
 
 def parse_store_mounts(
