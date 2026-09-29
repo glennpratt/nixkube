@@ -11,6 +11,9 @@ nothing reset it, so no build could last longer than NRI_TIMEOUT.
 
 import contextlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -233,3 +236,51 @@ class TestSilence:
         _, path = pub
         with subscriber(path) as sub:
             wait_for_completion(sub, CONTAINER, TIMEOUT, lambda: True)
+
+
+class TestTheHookExits:
+    """The whole hook, not just the loop: it must exit, whatever path fails it."""
+
+    def test_a_failure_answered_by_the_query_socket_exits(self, pub):
+        """The failure the query socket reports ends the process, promptly.
+
+        `fail_build` exits from inside the query, while the subscription from
+        phase 1 is still open. With `context.term()` in main's `finally`, that
+        exit blocked for ever: term waits for every socket to be closed.
+        """
+        _, pub_path = pub
+        reason = "no substituter can build it"
+        context = zmq.Context()
+        try:
+            rep = context.socket(zmq.REP)
+            rep_path = str(Path(_socket_dir()) / "q.sock")
+            rep.bind(f"ipc://{rep_path}")
+
+            def daemon():
+                rep.recv()
+                rep.send(json.dumps({"status": "failed", "reason": reason}).encode())
+
+            thread = threading.Thread(target=daemon)
+            thread.start()
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "nri_wait"],
+                    check=False,
+                    input=json.dumps({"id": CONTAINER, "pid": 1, "bundle": "/b"}),
+                    capture_output=True,
+                    text=True,
+                    timeout=10 * TIMEOUT,
+                    env={
+                        **os.environ,
+                        "NRI_QUERY_SOCKET": rep_path,
+                        "NRI_PUB_SOCKET": pub_path,
+                        "NRI_TIMEOUT": str(TIMEOUT),
+                    },
+                )
+            finally:
+                thread.join()
+        finally:
+            context.destroy(linger=0)
+
+        assert result.returncode == 1
+        assert reason in result.stderr

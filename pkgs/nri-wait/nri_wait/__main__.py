@@ -69,7 +69,11 @@ def main() -> None:
         # Phase 3: Wait for completion
         wait_for_completion(sub, container_id, timeout, ask)
     finally:
-        context.term()
+        # destroy, not term: term blocks until every socket is closed, and a
+        # build that failed exits from inside the query (`fail_build`) with
+        # the subscription still open. The hook would hang there until
+        # kubelet gave up on the start, instead of failing with the reason.
+        context.destroy(linger=0)
 
 
 if __name__ == "__main__":
