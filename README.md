@@ -95,9 +95,9 @@ kind: Pod
 metadata:
   name: hello-nri
   annotations:
-    nix-nri/pod: |
+    nixkube/pod: |
       /nix/store/hello-......
-    nix-nri/pod@aarch64-linux: |
+    nixkube/pod.aarch64-linux: |
       /nix/store/hello-aarch64-......
 spec:
   containers:
