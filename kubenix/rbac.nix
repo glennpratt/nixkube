@@ -20,7 +20,9 @@ in
             verbs = [
               "get"
               "list"
-            ];
+            ]
+            # Only to record what a pod's flake refs resolved to.
+            ++ lib.optional cfg.node.recordResolved "patch";
           }
           # Kubelet configz via API server proxy for CRI socket discovery
           {

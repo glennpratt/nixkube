@@ -126,6 +126,11 @@ NRI_BIND_FARM = os.environ.get("NRI_BIND_FARM", "true") == "true"
 # what NRI has always done.
 NRI_BUILD_POLICY = os.environ.get("NRI_BUILD_POLICY", "build")
 
+# Annotate a pod with what its flake-ref mount sources resolved to, as a
+# container's status names its image digest. Needs `patch` on pods, so off
+# unless asked for: nothing else NRI does writes to the API.
+NRI_RECORD_RESOLVED = os.environ.get("NRI_RECORD_RESOLVED", "false") == "true"
+
 # How long `nix store verify --recursive --no-trust` may take.
 #
 # It is the longest nix call on the publish path when it runs at all, and the

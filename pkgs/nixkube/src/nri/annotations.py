@@ -9,6 +9,7 @@ from nri import nri_pb2
 
 from ..store import extract_store_paths
 from .policy import BuildPolicy
+from .resolution import PullPolicy
 
 # Annotations from protobuf are ScalarMap[str, str], which implements Mapping.
 # Using Mapping keeps us compatible with both protobuf types and plain dicts (tests).
@@ -179,6 +180,29 @@ def parse_build_policy(
     if not values:
         return None
     return min(BuildPolicy.parse(v) for v in values)
+
+
+def parse_pull_policy(
+    pod_annotations: Annotations, container_name: str, system: str
+) -> PullPolicy:
+    """How this container's floating flake refs are resolved (see `resolution`).
+
+    Same shape as `parse_build_policy`: the container's annotation wins over
+    the pod's. `always` unless set, as for an image's `:latest`. An unknown
+    value raises, like an unknown build policy.
+
+    Annotations:
+      nixkube/pod-pull: "if-not-present"
+      nixkube/{container-name}-pull: "always"
+    """
+    values = list(
+        _iter_annotations(pod_annotations, f"{container_name}-pull", system)
+    ) or list(_iter_annotations(pod_annotations, "pod-pull", system))
+    if not values:
+        return PullPolicy.ALWAYS
+    policies = [PullPolicy.parse(v) for v in values]
+    # Several matching annotations: re-resolving is the safe disagreement.
+    return PullPolicy.ALWAYS if PullPolicy.ALWAYS in policies else policies[0]
 
 
 def parse_store_mounts(

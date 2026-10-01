@@ -922,6 +922,41 @@ open submodule of attribute set of (Nix config atom (null, bool, int, float, str
 
 
 
+## nixkube\.node\.recordResolved
+
+
+
+Whether to enable annotating each pod with what its flake-ref mount sources resolved to
+(` resolved.nixkube/<container> `), as a container status names its image
+digest\. Grants nixkube ` patch ` on pods; nothing else NRI does writes to
+the API\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+
+
+*Example:*
+
+```nix
+true
+```
+
+*Declared by:*
+ - [/kubenix/daemonset\.nix](file:///kubenix/daemonset.nix)
+
+
+
 ## nixkube\.node\.tolerations
 
 
