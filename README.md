@@ -131,6 +131,11 @@ once per node and remembered, as a digest would be. A **floating** ref
 trusting Nix's fetch cache; `if-not-present` reuses what the node resolved
 before. Nodes do not coordinate, so pin refs that must match everywhere.
 
+With `nixkube.node.recordResolved = true`, nixkube annotates each pod with
+what its flake-ref sources resolved to (`resolved.nixkube/<container>`), as
+a container status names its image digest. It's off by default because it
+needs `patch` on pods; nothing else NRI does writes to the API.
+
 What a node may do to realise a source is its build policy
 (`nixkube.node.buildPolicy`): `build`, `substitute` (evaluate, only fetch) or
 `pinned` (store paths only). A pod may tighten it, never loosen it.

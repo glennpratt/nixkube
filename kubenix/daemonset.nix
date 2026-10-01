@@ -80,6 +80,11 @@ in
       ];
       default = "build";
     };
+    recordResolved = lib.mkEnableOption ''
+      annotating each pod with what its flake-ref mount sources resolved to
+      (`resolved.nixkube/<container>`), as a container status names its image
+      digest. Grants nixkube `patch` on pods; nothing else NRI does writes to
+      the API'';
     nixConfig = lib.mkOption {
       description = "nix.conf for CSI/mounter/DaemonSet pods";
       type = (import ./nixOptions.nix) {
@@ -307,6 +312,7 @@ in
                         ENABLE_COMPAT_DRIVER.value = lib.boolToString cfg.node.compat;
                         NRI_ENABLED.value = "true";
                         NRI_BUILD_POLICY.value = cfg.node.buildPolicy;
+                        NRI_RECORD_RESOLVED.value = lib.boolToString cfg.node.recordResolved;
                         HOME.value = "/nix/var/nix-csi/root";
                         HOST_MOUNT_PATH.value = cfg.hostMountPath;
                         KUBE_NAMESPACE.valueFrom.fieldRef.fieldPath = "metadata.namespace";

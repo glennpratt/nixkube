@@ -24,6 +24,7 @@ from ..constants import (
     NRI_CONTAINERS,
     NRI_PLUGIN_IDX,
     NRI_PLUGIN_NAME,
+    NRI_RECORD_RESOLVED,
     NRI_RUNTIME_SOCKET,
 )
 from ..cri import get_cri_socket, list_container_ids
@@ -589,6 +590,7 @@ class NriPlugin(NriPluginBase):
             async with anyio.create_task_group() as pump:
                 pump.start_soon(self._pump_build_progress, container_id)
                 log.debug("progress_pump_started")
+                resolved_sources: dict[str, dict[str, str]] = {}
                 try:
                     store_paths = await self._build_and_mount(
                         log,
@@ -598,6 +600,7 @@ class NriPlugin(NriPluginBase):
                         nix_rw,
                         build_policy,
                         pull_policy,
+                        resolved_sources,
                     )
                 finally:
                     pump.cancel_scope.cancel()
@@ -611,6 +614,13 @@ class NriPlugin(NriPluginBase):
 
             # Copy all packages to cache in background
             schedule_copy_to_cache(self.tasks, store_paths)
+
+            if NRI_RECORD_RESOLVED and resolved_sources:
+                detach(
+                    self.tasks,
+                    partial(record_resolved, pod, container_name, resolved_sources),
+                    name="nri_record_resolved",
+                )
 
             # Report successful build
             await report_event(
@@ -669,6 +679,7 @@ class NriPlugin(NriPluginBase):
         nix_rw: bool,
         build_policy: BuildPolicy = BuildPolicy.BUILD,
         pull_policy: PullPolicy = PullPolicy.ALWAYS,
+        resolved_sources: dict[str, dict[str, str]] | None = None,
     ) -> set[Path]:
         """Realize the closure, link it in, then mount it into the namespace.
 
@@ -714,6 +725,8 @@ class NriPlugin(NriPluginBase):
                 log.info("mount_source_built", source=src, store_path=str(resolved))
             # Fetched and rooted with the rest below, reused or not.
             store_mounts[dst] = resolved
+            if resolved_sources is not None:
+                resolved_sources[str(dst)] = {"source": src, "path": str(resolved)}
             store_paths.add(resolved)
 
         # Realize storepaths
@@ -773,6 +786,35 @@ class NriPlugin(NriPluginBase):
         )
         await mount_in_container(pid, rootfs, nix_tree_path, mounts, nix_rw, farm_paths)
         return store_paths
+
+
+# The annotation `record_resolved` writes. Outside the `nixkube/` prefix, so
+# nothing could ever read it back as a mount.
+RESOLVED_ANNOTATION = "resolved.nixkube/{container}"
+
+
+async def record_resolved(
+    pod: Pod, container_name: str, resolved_sources: dict[str, dict[str, str]]
+) -> None:
+    """Annotate the pod with what its flake-ref sources resolved to.
+
+    The counterpart of a container status's image digest: after the fact,
+    from the node that did it. Failing is logged, never raised: the
+    container is already running, and this is only a record of it.
+    """
+    log = structlog.get_logger("nixkube.nri.record")
+    key = RESOLVED_ANNOTATION.format(container=container_name)
+    try:
+        await pod.patch(
+            {
+                "metadata": {
+                    "annotations": {key: json.dumps(resolved_sources, sort_keys=True)}
+                }
+            }
+        )
+        log.info("resolved_recorded", annotation=key)
+    except Exception:
+        log.exception("resolved_record_failed", annotation=key)
 
 
 async def reachable_rootfs(pid: int, bundle: str) -> str | None:
