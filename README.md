@@ -110,6 +110,31 @@ Examples:
 * [multi-system example](https://github.com/Lillecarl/hetzkube/blob/4ed76ec77bfb104d1c2307b1ba178efa61dd34e2/kubenix/modules/cheapam.nix#L113)
 * [single-system ci example(s)](https://github.com/Lillecarl/nix-csi/blob/3179e5f8383e760bbef313300a224e44f18722c7/kubenix/ci/default.nix)
 
+#### Flake refs as mount sources
+
+A mount's source may be a flake ref (or a Nix expression) instead of a store
+path; the node realises it before the container starts:
+
+```yaml
+metadata:
+  annotations:
+    nixkube/app: /app=github:NixOS/nixpkgs/<rev>#redis
+    nixkube/pod-pull: if-not-present   # optional: always (default) | if-not-present
+    nixkube/pod-build: substitute      # optional: tighten the node's build policy
+```
+
+Resolution follows OCI's pull semantics. A store path is fetched if
+missing. A **locked** ref (one naming a revision or a `narHash`) is resolved
+once per node and remembered, as a digest would be. A **floating** ref
+(a branch, or a registry name like `nixpkgs#hello`) follows the pull policy:
+`always` re-resolves it at every container start, refetching rather than
+trusting Nix's fetch cache; `if-not-present` reuses what the node resolved
+before. Nodes do not coordinate, so pin refs that must match everywhere.
+
+What a node may do to realise a source is its build policy
+(`nixkube.node.buildPolicy`): `build`, `substitute` (evaluate, only fetch) or
+`pinned` (store paths only). A pod may tighten it, never loosen it.
+
 [Documentation](https://lillecarl.github.io/nixkube/)
 
 ---

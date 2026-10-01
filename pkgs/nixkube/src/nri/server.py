@@ -50,6 +50,7 @@ from .annotations import (
     parse_build_policy,
     parse_nix_exclude,
     parse_nix_rw,
+    parse_pull_policy,
     parse_store_mounts,
 )
 from .cleanup import schedule_garbage_collection
@@ -60,6 +61,12 @@ from .policy import (
     effective_build_policy,
     nix_policy_args,
     node_build_policy,
+)
+from .resolution import (
+    PullPolicy,
+    PullPolicyError,
+    is_locked_ref,
+    resolutions,
 )
 from .zmq import ZeroMQServer
 
@@ -337,6 +344,12 @@ class NriPlugin(NriPluginBase):
             )
         except BuildPolicyError as e:
             build_policy, refusal = BuildPolicy.PINNED, str(e)
+        try:
+            pull_policy = parse_pull_policy(
+                req.pod.annotations, req.container.name, system
+            )
+        except PullPolicyError as e:
+            pull_policy, refusal = PullPolicy.ALWAYS, refusal or str(e)
         if flake_mounts and build_policy is BuildPolicy.PINNED and refusal is None:
             refusal = (
                 "build policy is 'pinned': mount sources must be store paths, not "
@@ -427,6 +440,7 @@ class NriPlugin(NriPluginBase):
                             store_mounts,
                             nix_rw,
                             build_policy,
+                            pull_policy,
                             name="nri_build",
                         )
                     except Exception:
@@ -511,6 +525,7 @@ class NriPlugin(NriPluginBase):
         store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
         build_policy: BuildPolicy = BuildPolicy.BUILD,
+        pull_policy: PullPolicy = PullPolicy.ALWAYS,
     ) -> None:
         """Run the build inside a scope the volume sweep can cancel.
 
@@ -530,6 +545,7 @@ class NriPlugin(NriPluginBase):
                 store_mounts,
                 nix_rw,
                 build_policy,
+                pull_policy,
             )
 
     async def _run_build_task(
@@ -541,6 +557,7 @@ class NriPlugin(NriPluginBase):
         store_mounts: dict[Path, MountSource] | None = None,
         nix_rw: bool = False,
         build_policy: BuildPolicy = BuildPolicy.BUILD,
+        pull_policy: PullPolicy = PullPolicy.ALWAYS,
     ) -> None:
         """Realize store paths, link into the volume, then namespace-mount store mounts.
 
@@ -580,6 +597,7 @@ class NriPlugin(NriPluginBase):
                         store_mounts,
                         nix_rw,
                         build_policy,
+                        pull_policy,
                     )
                 finally:
                     pump.cancel_scope.cancel()
@@ -650,6 +668,7 @@ class NriPlugin(NriPluginBase):
         store_mounts: dict[Path, MountSource] | None,
         nix_rw: bool,
         build_policy: BuildPolicy = BuildPolicy.BUILD,
+        pull_policy: PullPolicy = PullPolicy.ALWAYS,
     ) -> set[Path]:
         """Realize the closure, link it in, then mount it into the namespace.
 
@@ -668,17 +687,32 @@ class NriPlugin(NriPluginBase):
         # the volume, so they live exactly as long as the container.
         store_mounts = dict(store_mounts or {})
         store_paths = set(store_paths)
+        system = get_current_system()
         for i, (dst, src) in enumerate(sorted(store_mounts.items())):
             if isinstance(src, Path):
                 continue
-            gc_root = volume_path / f"source-{i}"
-            gc_root.mkdir(parents=True, exist_ok=True)
-            log.info("mount_source_building", source=src, destination=str(dst))
-            # A flake ref is a URL and never contains whitespace; any
-            # expression worth writing does.
-            build = build_nix_expr if any(c.isspace() for c in src) else build_flake_ref
-            resolved = await build(src, gc_root, extra_args)
-            log.info("mount_source_built", source=src, store_path=str(resolved))
+            # A locked ref is a digest: reuse what this node resolved before.
+            # A floating one is a tag: reuse only if the pod said so.
+            reuse = is_locked_ref(src) or pull_policy is PullPolicy.IF_NOT_PRESENT
+            resolved = resolutions().get(src, system) if reuse else None
+            if resolved is not None:
+                log.info("mount_source_reused", source=src, store_path=str(resolved))
+            else:
+                gc_root = volume_path / f"source-{i}"
+                gc_root.mkdir(parents=True, exist_ok=True)
+                log.info("mount_source_building", source=src, destination=str(dst))
+                # A flake ref is a URL and never contains whitespace; any
+                # expression worth writing does.
+                build = (
+                    build_nix_expr if any(c.isspace() for c in src) else build_flake_ref
+                )
+                # Re-resolving a floating ref means fetching it again, not
+                # trusting Nix's fetch cache for another `tarball-ttl`.
+                args = extra_args if reuse else [*extra_args, "--refresh"]
+                resolved = await build(src, gc_root, args)
+                resolutions().put(src, system, resolved)
+                log.info("mount_source_built", source=src, store_path=str(resolved))
+            # Fetched and rooted with the rest below, reused or not.
             store_mounts[dst] = resolved
             store_paths.add(resolved)
 
