@@ -103,19 +103,6 @@ rec {
           )
         ]
       ) [ ] policy.groups;
-    in
-    n2c.buildImage {
-      name = "${repo}/nix";
-      tag = "${nixkubeVersion}-${sysPkgs.nix.version}-${sysPkgs.stdenv.hostPlatform.system}";
-      arch = sysPkgs.go.GOARCH;
-
-      layers = chain;
-      # The remainder only. `maxLayers` does not apply to the named layers.
-      maxLayers = policy.restLayers;
-
-      # `nix` runs against the image's own store in the initContainer, and a
-      # store with no database is one Nix declines to read.
-      initializeNixDatabase = true;
 
       copyToRoot = [
         sysPkgs.dockerTools.binSh
@@ -138,6 +125,27 @@ rec {
           "APPSTARTER_FALLBACK_CACHE=${cacheEnv}"
         ];
       };
+    in
+    n2c.buildImage {
+      name = "${repo}/nix";
+      tag = "${nixkubeVersion}-${sysPkgs.nix.version}-${sysPkgs.stdenv.hostPlatform.system}";
+      arch = sysPkgs.go.GOARCH;
+
+      layers = chain;
+      # The remainder only. `maxLayers` does not apply to the named layers.
+      maxLayers = policy.restLayers;
+
+      # `nix` runs against the image's own store in the initContainer, and a
+      # store with no database is one Nix declines to read.
+      initializeNixDatabase = true;
+
+      inherit copyToRoot config;
+    }
+    // {
+      # What the image holds, apart from how it is layered: for building
+      # the same image another way, such as nix-snapshotter's `nix:` images,
+      # which reference store paths instead of carrying them.
+      contents = { inherit copyToRoot config; };
     }
   );
 
